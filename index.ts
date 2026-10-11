@@ -2476,6 +2476,12 @@ async function whileBlocked<T>(pi: ExtensionAPI, run: () => Promise<T>): Promise
  * the terminal keeps drawing the component. The custom call then resolves with the
  * reader's answers, or `undefined` when the card closed unanswered; that cancels the
  * prompt instead of falling back to the dialogs, which would ask the reader twice.
+ *
+ * For such a host the card is the whole prompt (the owner's rule, reported again on
+ * 2026-10-12): no terminal component, no select()/input() fallback and no follow-up
+ * comment dialog, before or after it. A prompt too long for the card is fitted to it;
+ * one that cannot fit (too many questions or options) is not asked at all, and the
+ * tool answers the model with the bound to ask within.
  */
 interface WebQuestion {
    id: string;
@@ -2506,6 +2512,46 @@ function hostDrawsQuestions(ui: ExtensionUIContext): boolean {
 
 /** PI WEB's bounds for a declared question. A set that would not fit keeps the terminal screen. */
 const WEB_LIMITS = { questions: 20, options: 12, id: 128, text: 1_000, detail: 32_000 };
+
+function cut(text: string, max: number): string {
+   return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
+}
+
+/**
+ * The declared questions brought inside the card's bounds, or why they cannot be. A
+ * question too long for its line moves whole into the detail, ahead of the context; a
+ * detail or option text past its bound is cut with an ellipsis; a question with no
+ * options takes a typed answer. Too many questions or options is the one thing that
+ * cannot be fitted without dropping a choice, so it is refused instead.
+ */
+function fitQuestionsCard(questions: readonly WebQuestion[]): { questions: WebQuestion[] } | { refused: string } {
+   if (questions.length > WEB_LIMITS.questions) {
+      return { refused: `${questions.length} questions; PI WEB's card takes at most ${WEB_LIMITS.questions}. Ask again with at most ${WEB_LIMITS.questions} questions.` };
+   }
+   const crowded = questions.find((question) => question.options.length > WEB_LIMITS.options);
+   if (crowded !== undefined) {
+      return { refused: `"${cut(crowded.question, 80)}" has ${crowded.options.length} options; PI WEB's card takes at most ${WEB_LIMITS.options}. Ask again with at most ${WEB_LIMITS.options} options per question.` };
+   }
+   return {
+      questions: questions.map((question) => {
+         const long = question.question.length > WEB_LIMITS.text;
+         const detail = long ? [question.question, question.detail].filter(Boolean).join("\n\n") : question.detail;
+         const { custom: _custom, customInput: _customInput, ...rest } = question;
+         const typed = question.options.length === 0 || question.customInput === "field";
+         return {
+            ...rest,
+            question: cut(question.question, WEB_LIMITS.text),
+            ...(detail === undefined ? {} : { detail: cut(detail, WEB_LIMITS.detail) }),
+            options: question.options.map((option) => ({
+               ...option,
+               label: cut(option.label, WEB_LIMITS.text),
+               ...(option.detail === undefined ? {} : { detail: cut(option.detail, WEB_LIMITS.text) }),
+            })),
+            ...(typed ? { customInput: "field" as const } : { custom: false as const }),
+         };
+      }),
+   };
+}
 
 function fitsQuestionsCard(questions: readonly WebQuestion[]): boolean {
    const fits = (text: string, max: number): boolean => text.trim() !== "" && text.length <= max;
@@ -2561,23 +2607,6 @@ function responseFromWeb(answer: WebAnswer | undefined, options: QuestionOption[
    const typed = answer.otherText?.trim();
    if (titles.length === 0) return createFreeformResponse(typed);
    return createSelectionResponse(typed ? [...titles, typed] : titles);
-}
-
-/** The optional comment on a selection, asked after the card the way the select()/input() fallback asks it. */
-async function withComment(
-   ui: { input: Function },
-   prompt: string,
-   response: AskResponse,
-   dialogOpts: DialogOptions | undefined,
-): Promise<AskResponse | null> {
-   if (!isSelectionResponse(response)) return response;
-   const comment = await ui.input(
-      buildCommentPrompt(prompt, response.selections),
-      "Optional comment (press Enter to skip)...",
-      dialogOpts,
-   ) as string | undefined;
-   if (dialogOpts?.signal?.aborted || isCancelledInput(comment)) return null;
-   return createSelectionResponse(response.selections, comment);
 }
 
 function readWebAnswers(value: unknown): WebAnswer[] | undefined {
@@ -2675,9 +2704,14 @@ async function runCustomPrompt<T>(ui: ExtensionUIContext, request: CustomPromptR
          });
       }
 
-      const declared = request.web !== undefined && hostDrawsQuestions(ui) && fitsQuestionsCard(request.web.questions)
-         ? request.web
+      const fitted = request.web !== undefined && hostDrawsQuestions(ui) ? fitQuestionsCard(request.web.questions) : undefined;
+      if (fitted !== undefined && "refused" in fitted) throw new Error(`ask_user was not shown: ${fitted.refused}`);
+      const declared = request.web !== undefined && fitted !== undefined && fitsQuestionsCard(fitted.questions)
+         ? { ...request.web, questions: fitted.questions }
          : undefined;
+      if (fitted !== undefined && declared === undefined) {
+         throw new Error("ask_user was not shown: the question does not fit PI WEB's card. Ask again with shorter text and at most 12 options.");
+      }
       const customOptions = buildCustomUIOptions(displayMode, (handle) => {
          overlayHandle = handle;
       });
@@ -2890,11 +2924,7 @@ async function executeBatch(
                const read: BatchAnswer[] = [];
                for (const [index, entry] of questions.entries()) {
                   const response = responseFromWeb(answers.find((answer) => answer.id === batchQuestionId(index)), entry.options);
-                  const commented = response === null || !settings.allowComment
-                     ? response
-                     : await withComment(ctx.ui, entry.question, response, { signal: batch.signal });
-                  if (response !== null && commented === null) return null;
-                  read.push(commented === null ? { status: "skipped" } : { status: "answered", response: commented });
+                  read.push(response === null ? { status: "skipped" } : { status: "answered", response });
                }
                return read;
             },
@@ -3204,12 +3234,7 @@ export default function(pi: ExtensionAPI) {
             ),
             web: {
                questions: [webQuestion("answer", question, normalizedContext, options, allowMultiple, allowFreeform)],
-               read: async (answers) => {
-                  const response = responseFromWeb(answers.find((answer) => answer.id === "answer"), options);
-                  if (response === null || !allowComment) return response;
-                  const prompt = normalizedContext ? `${question}\n\nContext:\n${normalizedContext}` : question;
-                  return await withComment(ctx.ui, prompt, response, dialogOpts);
-               },
+               read: async (answers) => responseFromWeb(answers.find((answer) => answer.id === "answer"), options),
             },
          }));
 
