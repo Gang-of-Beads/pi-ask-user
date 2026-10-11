@@ -2469,6 +2469,133 @@ async function whileBlocked<T>(pi: ExtensionAPI, run: () => Promise<T>): Promise
    }
 }
 
+/**
+ * PI WEB draws a `ctx.ui.custom` screen declared as `questions` as its own Questions card:
+ * the options and a typed answer on one card, with no terminal component mounted. A host
+ * that draws it lists "questions" in `ctx.ui.piWebScreens`. pi ignores the `web` option, so
+ * the terminal keeps drawing the component. The custom call then resolves with the
+ * reader's answers, or `undefined` when the card closed unanswered; that cancels the
+ * prompt instead of falling back to the dialogs, which would ask the reader twice.
+ */
+interface WebQuestion {
+   id: string;
+   question: string;
+   detail?: string;
+   options: Array<{ value: string; label: string; detail?: string }>;
+   multiple?: true;
+   custom?: false;
+   customInput?: "field";
+}
+
+interface WebAnswer {
+   id: string;
+   values: string[];
+   otherText?: string;
+}
+
+interface WebDeclaration<T> {
+   questions: WebQuestion[];
+   /** This tool's own result for the reader's answers; `null` cancels. */
+   read: (answers: WebAnswer[]) => Promise<T | null>;
+}
+
+function hostDrawsQuestions(ui: ExtensionUIContext): boolean {
+   const screens: unknown = Reflect.get(ui, "piWebScreens");
+   return Array.isArray(screens) && screens.includes("questions");
+}
+
+/** PI WEB's bounds for a declared question. A set that would not fit keeps the terminal screen. */
+const WEB_LIMITS = { questions: 20, options: 12, id: 128, text: 1_000, detail: 32_000 };
+
+function fitsQuestionsCard(questions: readonly WebQuestion[]): boolean {
+   const fits = (text: string, max: number): boolean => text.trim() !== "" && text.length <= max;
+   const unique = (values: readonly string[]): boolean => new Set(values).size === values.length;
+   return questions.length > 0
+      && questions.length <= WEB_LIMITS.questions
+      && unique(questions.map((question) => question.id))
+      && questions.every((question) =>
+         fits(question.id, WEB_LIMITS.id)
+         && fits(question.question, WEB_LIMITS.text)
+         && (question.detail === undefined || fits(question.detail, WEB_LIMITS.detail))
+         && question.options.length <= WEB_LIMITS.options
+         && (question.options.length > 0 || question.custom !== false)
+         && unique(question.options.map((option) => option.value))
+         && question.options.every((option) =>
+            fits(option.value, WEB_LIMITS.id)
+            && fits(option.label, WEB_LIMITS.text)
+            && (option.detail === undefined || fits(option.detail, WEB_LIMITS.text))));
+}
+
+function webQuestion(
+   id: string,
+   question: string,
+   context: string | undefined,
+   options: QuestionOption[],
+   allowMultiple: boolean,
+   allowFreeform: boolean,
+): WebQuestion {
+   return {
+      id,
+      question,
+      ...(context ? { detail: context } : {}),
+      options: options.map((option, index) => ({
+         value: String(index),
+         label: option.title,
+         ...(option.description ? { detail: option.description } : {}),
+      })),
+      ...(allowMultiple ? { multiple: true as const } : {}),
+      ...(allowFreeform ? { customInput: "field" as const } : { custom: false as const }),
+   };
+}
+
+/**
+ * One declared question's answer as this tool's response, or `null` when it was left open. Typed
+ * text alone is a freeform answer; beside chosen options (a multiple-answer question) it is one
+ * more selection, as in the select()/input() fallback.
+ */
+function responseFromWeb(answer: WebAnswer | undefined, options: QuestionOption[]): AskResponse | null {
+   if (answer === undefined) return null;
+   const titles = answer.values
+      .map((value) => options[Number(value)]?.title)
+      .filter((title): title is string => title !== undefined);
+   const typed = answer.otherText?.trim();
+   if (titles.length === 0) return createFreeformResponse(typed);
+   return createSelectionResponse(typed ? [...titles, typed] : titles);
+}
+
+/** The optional comment on a selection, asked after the card the way the select()/input() fallback asks it. */
+async function withComment(
+   ui: { input: Function },
+   prompt: string,
+   response: AskResponse,
+   dialogOpts: DialogOptions | undefined,
+): Promise<AskResponse | null> {
+   if (!isSelectionResponse(response)) return response;
+   const comment = await ui.input(
+      buildCommentPrompt(prompt, response.selections),
+      "Optional comment (press Enter to skip)...",
+      dialogOpts,
+   ) as string | undefined;
+   if (dialogOpts?.signal?.aborted || isCancelledInput(comment)) return null;
+   return createSelectionResponse(response.selections, comment);
+}
+
+function readWebAnswers(value: unknown): WebAnswer[] | undefined {
+   if (typeof value !== "object" || value === null) return undefined;
+   const answers: unknown = Reflect.get(value, "answers");
+   return Array.isArray(answers) && answers.every(isWebAnswer) ? answers : undefined;
+}
+
+function isWebAnswer(value: unknown): value is WebAnswer {
+   if (typeof value !== "object" || value === null) return false;
+   const values: unknown = Reflect.get(value, "values");
+   const otherText: unknown = Reflect.get(value, "otherText");
+   return typeof Reflect.get(value, "id") === "string"
+      && Array.isArray(values)
+      && values.every((entry) => typeof entry === "string")
+      && (otherText === undefined || typeof otherText === "string");
+}
+
 interface CustomPromptRequest<T> {
    signal?: AbortSignal;
    timeout?: number;
@@ -2482,6 +2609,8 @@ interface CustomPromptRequest<T> {
    ) => Component;
    /** RPC/headless mode: ctx.ui.custom() returns undefined, so degrade to the select()/input() dialogs. */
    fallback: () => Promise<T | null>;
+   /** The same prompt as PI WEB's Questions card, for a host that draws it. */
+   web?: WebDeclaration<T>;
 }
 
 /**
@@ -2546,14 +2675,22 @@ async function runCustomPrompt<T>(ui: ExtensionUIContext, request: CustomPromptR
          });
       }
 
+      const declared = request.web !== undefined && hostDrawsQuestions(ui) && fitsQuestionsCard(request.web.questions)
+         ? request.web
+         : undefined;
+      const customOptions = buildCustomUIOptions(displayMode, (handle) => {
+         overlayHandle = handle;
+      });
       const customResult = signal?.aborted ? null : await ui.custom<T | null>(
          customFactory,
-         buildCustomUIOptions(displayMode, (handle) => {
-            overlayHandle = handle;
-         }),
+         declared === undefined ? customOptions : Object.assign({}, customOptions, { web: { kind: "questions", questions: declared.questions } }),
       );
 
       if (signal?.aborted) return null;
+      if (declared !== undefined) {
+         const answers = readWebAnswers(customResult);
+         return answers === undefined ? null : await declared.read(answers);
+      }
       if (customResult !== undefined) return customResult;
       return await request.fallback();
    } catch (error) {
@@ -2695,6 +2832,10 @@ function formatBatchForMessage(questions: BatchQuestion[], allowComment: boolean
    return `Ask requires interactive mode. Please answer these questions:\n\n${blocks.join("\n\n")}${commentHint}`;
 }
 
+function batchQuestionId(index: number): string {
+   return `q${String(index + 1)}`;
+}
+
 async function executeBatch(
    pi: ExtensionAPI,
    params: AskParams,
@@ -2742,6 +2883,22 @@ async function executeBatch(
          createComponent: (tui, theme, keybindings, complete) =>
             new BatchAskComponent(questions, settings, tui, theme, keybindings, complete),
          fallback: () => askBatchViaDialogs(ctx.ui, questions, settings.allowComment, batch.signal, deadline),
+         web: {
+            questions: questions.map((entry, index) =>
+               webQuestion(batchQuestionId(index), entry.question, entry.context, entry.options, entry.allowMultiple, entry.allowFreeform)),
+            read: async (answers) => {
+               const read: BatchAnswer[] = [];
+               for (const [index, entry] of questions.entries()) {
+                  const response = responseFromWeb(answers.find((answer) => answer.id === batchQuestionId(index)), entry.options);
+                  const commented = response === null || !settings.allowComment
+                     ? response
+                     : await withComment(ctx.ui, entry.question, response, { signal: batch.signal });
+                  if (response !== null && commented === null) return null;
+                  read.push(commented === null ? { status: "skipped" } : { status: "answered", response: commented });
+               }
+               return read;
+            },
+         },
       }));
    } finally {
       if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
@@ -3045,6 +3202,15 @@ export default function(pi: ExtensionAPI) {
                allowComment,
                dialogOpts,
             ),
+            web: {
+               questions: [webQuestion("answer", question, normalizedContext, options, allowMultiple, allowFreeform)],
+               read: async (answers) => {
+                  const response = responseFromWeb(answers.find((answer) => answer.id === "answer"), options);
+                  if (response === null || !allowComment) return response;
+                  const prompt = normalizedContext ? `${question}\n\nContext:\n${normalizedContext}` : question;
+                  return await withComment(ctx.ui, prompt, response, dialogOpts);
+               },
+            },
          }));
 
          if (signal?.aborted || result === null) {
