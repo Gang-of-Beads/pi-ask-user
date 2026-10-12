@@ -2737,7 +2737,7 @@ async function runCustomPrompt<T>(ui: ExtensionUIContext, request: CustomPromptR
       });
       const customResult = signal?.aborted ? null : await ui.custom<T | null>(
          customFactory,
-         declared === undefined ? customOptions : Object.assign({}, customOptions, { web: { kind: "card", fields: declared.questions.map(cardField) } }),
+         declared === undefined ? customOptions : Object.assign({}, customOptions, { web: { kind: "card", title: "Questions", submit: "Send answers", fields: declared.questions.map(cardField) } }),
       );
 
       if (signal?.aborted) return null;
