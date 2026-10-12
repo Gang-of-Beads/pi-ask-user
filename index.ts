@@ -2470,12 +2470,13 @@ async function whileBlocked<T>(pi: ExtensionAPI, run: () => Promise<T>): Promise
 }
 
 /**
- * PI WEB draws a `ctx.ui.custom` screen declared as `questions` as its own Questions card:
- * the options and a typed answer on one card, with no terminal component mounted. A host
- * that draws it lists "questions" in `ctx.ui.piWebScreens`. pi ignores the `web` option, so
- * the terminal keeps drawing the component. The custom call then resolves with the
- * reader's answers, or `undefined` when the card closed unanswered; that cancels the
- * prompt instead of falling back to the dialogs, which would ask the reader twice.
+ * PI WEB draws a `ctx.ui.custom` screen declared as an interactive card (`web: { kind:
+ * "card", fields }`) as its own card: each question a choice field (or a typed field when it
+ * has no options), with no terminal component mounted. A host that draws it lists "card" in
+ * `ctx.ui.piWebScreens`. pi ignores the `web` option, so the terminal keeps drawing the
+ * component. The custom call then resolves with the card's values keyed by field id, or
+ * `undefined` when the card closed unanswered; that cancels the prompt instead of falling back
+ * to the dialogs, which would ask the reader twice.
  *
  * For such a host the card is the whole prompt (the owner's rule, reported again on
  * 2026-10-12): no terminal component, no select()/input() fallback and no follow-up
@@ -2507,7 +2508,22 @@ interface WebDeclaration<T> {
 
 function hostDrawsQuestions(ui: ExtensionUIContext): boolean {
    const screens: unknown = Reflect.get(ui, "piWebScreens");
-   return Array.isArray(screens) && screens.includes("questions");
+   return Array.isArray(screens) && screens.includes("card");
+}
+
+/** One question as a field of PI WEB's interactive card: a choice, or a typed field when it offers no options. */
+function cardField(question: WebQuestion): Record<string, unknown> {
+   const described = question.detail === undefined ? {} : { detail: question.detail };
+   if (question.options.length === 0) return { type: "input", id: question.id, label: question.question, multiline: true, ...described };
+   return {
+      type: "choice",
+      id: question.id,
+      label: question.question,
+      ...described,
+      options: question.options,
+      ...(question.multiple ? { multiple: true } : {}),
+      ...(question.customInput === "field" ? { other: "field" } : {}),
+   };
 }
 
 /** PI WEB's bounds for a declared question. A set that would not fit keeps the terminal screen. */
@@ -2609,20 +2625,24 @@ function responseFromWeb(answer: WebAnswer | undefined, options: QuestionOption[
    return createSelectionResponse(typed ? [...titles, typed] : titles);
 }
 
+/** The card's values (`{ values: { [id]: { selected, other? } | { text } } }`) as one answer per filled question. */
 function readWebAnswers(value: unknown): WebAnswer[] | undefined {
    if (typeof value !== "object" || value === null) return undefined;
-   const answers: unknown = Reflect.get(value, "answers");
-   return Array.isArray(answers) && answers.every(isWebAnswer) ? answers : undefined;
+   const values: unknown = Reflect.get(value, "values");
+   if (typeof values !== "object" || values === null || Array.isArray(values)) return undefined;
+   const answers = Object.entries(values).map(([id, entry]) => webAnswer(id, entry));
+   return answers.every((answer): answer is WebAnswer => answer !== undefined) ? answers : undefined;
 }
 
-function isWebAnswer(value: unknown): value is WebAnswer {
-   if (typeof value !== "object" || value === null) return false;
-   const values: unknown = Reflect.get(value, "values");
-   const otherText: unknown = Reflect.get(value, "otherText");
-   return typeof Reflect.get(value, "id") === "string"
-      && Array.isArray(values)
-      && values.every((entry) => typeof entry === "string")
-      && (otherText === undefined || typeof otherText === "string");
+function webAnswer(id: string, entry: unknown): WebAnswer | undefined {
+   if (typeof entry !== "object" || entry === null) return undefined;
+   const text: unknown = Reflect.get(entry, "text");
+   if (typeof text === "string") return { id, values: [], otherText: text };
+   const selected: unknown = Reflect.get(entry, "selected");
+   const other: unknown = Reflect.get(entry, "other");
+   if (!Array.isArray(selected) || !selected.every((pick) => typeof pick === "string")) return undefined;
+   if (other !== undefined && typeof other !== "string") return undefined;
+   return { id, values: selected, ...(other === undefined ? {} : { otherText: other }) };
 }
 
 interface CustomPromptRequest<T> {
@@ -2638,7 +2658,7 @@ interface CustomPromptRequest<T> {
    ) => Component;
    /** RPC/headless mode: ctx.ui.custom() returns undefined, so degrade to the select()/input() dialogs. */
    fallback: () => Promise<T | null>;
-   /** The same prompt as PI WEB's Questions card, for a host that draws it. */
+   /** The same prompt as PI WEB's interactive card, for a host that draws it. */
    web?: WebDeclaration<T>;
 }
 
@@ -2717,7 +2737,7 @@ async function runCustomPrompt<T>(ui: ExtensionUIContext, request: CustomPromptR
       });
       const customResult = signal?.aborted ? null : await ui.custom<T | null>(
          customFactory,
-         declared === undefined ? customOptions : Object.assign({}, customOptions, { web: { kind: "questions", questions: declared.questions } }),
+         declared === undefined ? customOptions : Object.assign({}, customOptions, { web: { kind: "card", fields: declared.questions.map(cardField) } }),
       );
 
       if (signal?.aborted) return null;
