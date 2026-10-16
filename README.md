@@ -49,7 +49,7 @@ See: `skills/ask-user/references/ask-user-skill-extension-spec.md`.
 ## Install
 
 ```bash
-pi install npm:pi-ask-user
+pi install npm:@gang-of-beads/pi-ask-user
 ```
 
 ## Tool name
