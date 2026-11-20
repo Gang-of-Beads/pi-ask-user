@@ -29,6 +29,9 @@
 
 - A call that sends both `question` and `questions` now treats the top-level `question` as the batch heading instead of failing. The heading appears in the frame title, review page, native Tern sheets, fallback dialogs, and result text, and is returned as `details.heading`. ([#83](https://github.com/edlsh/pi-ask-user/pull/83))
 
+## 0.16.1 - 2026-10-16
+
+- Publish the Gang of Beads distribution as `@gang-of-beads/pi-ask-user`, including its PI WEB question cards. The `ask_user` tool and decision skill keep their existing names.
 ## [0.16.0](https://github.com/edlsh/pi-ask-user/releases/tag/v0.16.0) - 2026-10-02
 
 ### Added

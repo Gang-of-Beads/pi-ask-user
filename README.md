@@ -49,7 +49,7 @@ See: `skills/ask-user/references/ask-user-skill-extension-spec.md`.
 ## Install
 
 ```bash
-pi install npm:pi-ask-user
+pi install npm:@gang-of-beads/pi-ask-user
 ```
 
 ## Tool name
@@ -268,6 +268,20 @@ A batch publishes nothing until the user submits it. Then each answered question
 ```
 
 Set `PI_ASK_USER_EMIT_FULL_EVENTS=true` (or `1`, `yes`, `on`), or `"emitFullEvents": true` in `ask-user.json`, to restore the full payloads — `context`, the offered `options` on cancel, and the complete `response` including selections, comment, and freeform text. Leave it unset unless another extension you trust needs the answer itself; the full response is always available to the agent through the tool result's `details`.
+
+
+## PI WEB
+
+[PI WEB](https://github.com/Gang-of-Beads/pi-web) draws an extension's screen as a native card when the extension declares one. When `ctx.ui.piWebScreens` includes `"card"`, `ask_user` declares its prompt as PI WEB's interactive card (`web: { kind: "card", title: "Questions", submit: "Send answers", fields }`) and PI WEB never mounts the terminal component:
+
+- Each question is a `choice` field, its options keyed by index; a question without options is a typed `input` field.
+- `allowFreeform` shows the typed answer as a box under the options; `allowMultiple` allows several picks.
+- Several questions show one per page with Back and Next, and the last page sends.
+- The card's values come back as the tool's usual answer, so the model reads the same result as in pi's terminal.
+- A card closed unanswered (Cancel, Stop, timeout) cancels the prompt. It does not fall back to `select()` / `input()`, which would ask a second time.
+- A prompt that cannot fit the card (more than 20 questions, or more than 12 options in one) is not shown; the tool tells the model the limit to ask within.
+
+In pi's terminal, and in any host that does not list `"card"`, the prompt is the terminal component as before.
 
 ## Known limitations
 
