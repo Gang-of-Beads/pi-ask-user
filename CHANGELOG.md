@@ -1,9 +1,37 @@
 # Changelog
 
+## [0.17.2](https://github.com/edlsh/pi-ask-user/compare/v0.17.1...v0.17.2) (2026-11-01)
+
+
+### Bug Fixes
+
+* ignore top-level single-question fields in questions batches ([#88](https://github.com/edlsh/pi-ask-user/issues/88)) ([7e2cf4d](https://github.com/edlsh/pi-ask-user/commit/7e2cf4d0dbda649f75edc92c6433e37cc4592328))
+* wrap single-select text by display width ([#95](https://github.com/edlsh/pi-ask-user/issues/95)) ([d0a16b3](https://github.com/edlsh/pi-ask-user/commit/d0a16b3b3b6f22204a2781aec2c3a6e65d48e1d5))
+
+## [0.17.1](https://github.com/edlsh/pi-ask-user/releases/tag/v0.17.1) - 2026-10-29
+
+### Fixed
+
+- In Tern, the native prompt is drawn in the composer's place (omp's current `omp.editor.ask` shape) instead of a modal sheet over the transcript. Option marks no longer overlap the option labels, the prompt stays within 60% of the pane with the context and options scrolling inside it, the transcript stays visible, batch tabs no longer show raw ANSI resets, and the review page keeps its answers in view beside short question keys. Needs a pi-tern that places composer-shaped presentations in the dock. ([#89](https://github.com/edlsh/pi-ask-user/pull/89))
+
+## [0.17.0](https://github.com/edlsh/pi-ask-user/releases/tag/v0.17.0) - 2026-10-19
+
+### Changed
+
+- `ask_user` declares `exposure: "model-only"`, so codemode and other scripts cannot open user prompts. Hosts older than Pi 1.0.2 ignore the field at runtime. ([#78](https://github.com/edlsh/pi-ask-user/pull/78))
+
+### Added
+
+- Optional `ask-user.json` settings file in the agent directory (`~/.pi/agent`, or `PI_CODING_AGENT_DIR` when set) for personal defaults: `displayMode`, `singleSelectLayout`, `allowComment`, `contextExpanded`, `overlayToggleKey`, `commentToggleKey`, and `emitFullEvents`. Precedence is per-call parameter, then environment variable, then the file, then the built-in default. The file is re-read on every call; unknown keys and invalid values are ignored, and malformed JSON fails the call with the file path. ([#71](https://github.com/edlsh/pi-ask-user/pull/71))
+- Native presentation in [Tern](https://stencil.so) through [pi-tern](https://github.com/edlsh/pi-tern)'s optional hooks: the prompt is a native sheet in omp's ask style (question tabs, markdown question and context, clickable options, a native editor bound to the custom-response and comment editor, the review page, an action bar), and the tool card shows every option with the chosen ones checked. Pointer events run the same transitions as the keys. Without pi-tern nothing changes; the hooks are global symbols and nothing imports pi-tern.
+
+### Fixed
+
+- A call that sends both `question` and `questions` now treats the top-level `question` as the batch heading instead of failing. The heading appears in the frame title, review page, native Tern sheets, fallback dialogs, and result text, and is returned as `details.heading`. ([#83](https://github.com/edlsh/pi-ask-user/pull/83))
+
 ## 0.16.1 - 2026-10-16
 
 - Publish the Gang of Beads distribution as `@gang-of-beads/pi-ask-user`, including its PI WEB question cards. The `ask_user` tool and decision skill keep their existing names.
-
 ## [0.16.0](https://github.com/edlsh/pi-ask-user/releases/tag/v0.16.0) - 2026-10-02
 
 ### Added

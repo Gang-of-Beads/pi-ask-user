@@ -40,6 +40,24 @@ import {
    wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import { renderSingleSelectRows, type QuestionOption } from "./single-select-layout";
+import {
+   askToolCard,
+   CHOICE_LIST_KEY,
+   type ChoiceList,
+   type ChoiceRow,
+   choiceSheet,
+   NATIVE_COMPONENT,
+   type QuestionTabs,
+   registerTernTool,
+   reviewSheet,
+   shortLabel,
+   type TernContext,
+   type TernEvent,
+   type TernNode,
+   nodeKey,
+   textSheet,
+} from "./tern";
+import { loadAskUserSettings } from "./settings";
 
 import { createRequire } from "node:module";
 const _require = createRequire(import.meta.url);
@@ -78,6 +96,7 @@ export function StringEnum<const T extends readonly string[]>(
    // enclosing `Type.Object` keeps every optional key optional. Chainable
    // `.describe()`/`.default()` are the shim's way to attach metadata; the
    // options argument covers builders that take it positionally instead.
+   // SAFETY: shim unions may expose these chainable methods; each is checked before calling.
    let schema = builder.Union(values.map((value) => builder.Literal(value)), meta) as unknown as {
       describe?: (text: string) => unknown;
       default?: (value: unknown) => unknown;
@@ -88,6 +107,7 @@ export function StringEnum<const T extends readonly string[]>(
    if (options?.default !== undefined && typeof schema.default === "function") {
       schema = schema.default(options.default) as typeof schema;
    }
+   // SAFETY: the union contains exactly the supplied string literals, matching T[number].
    return schema as unknown as TUnsafe<T[number]>;
 }
 
@@ -183,6 +203,8 @@ type BatchAnswer = { status: "answered"; response: AskResponse } | { status: "sk
 /** Result details of a `questions` batch. Single-question results keep AskToolDetails. */
 interface AskBatchDetails {
    kind: "batch";
+   /** The top-level question sent alongside questions, shown as the batch heading. */
+   heading?: string;
    questions: Array<{ question: string; context?: string; options: QuestionOption[] }>;
    /** Index-aligned with `questions`; empty when the batch was cancelled. */
    answers: BatchAnswer[];
@@ -195,8 +217,6 @@ function isBatchDetails<T extends AskToolDetails | AskBatchDetails>(details: T):
 
 const BATCH_MIN_QUESTIONS = 2;
 const BATCH_MAX_QUESTIONS = 4;
-// Single-question fields that a batch sets per entry instead of at the top level.
-const BATCH_ENTRY_FIELDS = ["context", "options", "allowMultiple", "allowFreeform"] as const;
 
 type AskUIResult = AskResponse;
 
@@ -431,9 +451,10 @@ function buildShortcut(spec: string): ResolvedShortcut {
 function resolveShortcut(
    paramValue: string | null | undefined,
    envValue: string | undefined,
+   fileValue: string | undefined,
    defaultSpec: string,
 ): ResolvedShortcut {
-   const candidates: Array<string | null | undefined> = [paramValue, envValue, defaultSpec];
+   const candidates: Array<string | null | undefined> = [paramValue, envValue, fileValue, defaultSpec];
    for (const raw of candidates) {
       const normalized = normalizeShortcutSpec(raw);
       if (normalized === undefined) continue; // not provided, fall through
@@ -658,40 +679,67 @@ class MultiSelectList implements Component {
       }
 
       if (matchesKey(data, Key.space)) {
-         if (this.isCommentToggleRow(this.selectedIndex)) {
-            this.toggleComment();
-            return;
-         }
-         if (this.isFreeformRow(this.selectedIndex)) {
-            this.onEnterFreeform?.();
-            return;
-         }
-         this.toggle(this.selectedIndex);
-         this.invalidate();
+         this.activate();
          return;
       }
 
       if (this.keybindings.matches(data, "tui.select.confirm")) {
-         if (this.isCommentToggleRow(this.selectedIndex)) {
-            this.toggleComment();
+         if (this.isCommentToggleRow(this.selectedIndex) || this.isFreeformRow(this.selectedIndex)) {
+            this.activate();
             return;
          }
-         if (this.isFreeformRow(this.selectedIndex)) {
-            this.onEnterFreeform?.();
-            return;
-         }
-
-         const selectedTitles = Array.from(this.checked)
-            .sort((a, b) => a - b)
-            .map((i) => this.options[i]?.title)
-            .filter((t): t is string => !!t);
-
-         const fallback = this.options[this.selectedIndex]?.title;
-         const result = selectedTitles.length > 0 ? selectedTitles : fallback ? [fallback] : [];
-
-         if (result.length > 0) this.onSubmit?.(result);
-         else this.onCancel?.();
+         this.submit();
       }
+   }
+
+   /** Space on the selected row: tick the option, toggle the comment, or open the custom response. */
+   private activate(): void {
+      if (this.isCommentToggleRow(this.selectedIndex)) {
+         this.toggleComment();
+         return;
+      }
+      if (this.isFreeformRow(this.selectedIndex)) {
+         this.onEnterFreeform?.();
+         return;
+      }
+      this.toggle(this.selectedIndex);
+      this.invalidate();
+   }
+
+   /** Submit the ticked options, or the selected one when none is ticked. */
+   submit(): void {
+      const selectedTitles = Array.from(this.checked)
+         .sort((a, b) => a - b)
+         .map((i) => this.options[i]?.title)
+         .filter((t): t is string => !!t);
+
+      const fallback = this.options[this.selectedIndex]?.title;
+      const result = selectedTitles.length > 0 ? selectedTitles : fallback ? [fallback] : [];
+
+      if (result.length > 0) this.onSubmit?.(result);
+      else this.onCancel?.();
+   }
+
+   /** The rows as shown (options with their ticks, comment toggle, custom response), for Tern's native sheet. */
+   nativeSheet(): ChoiceList {
+      const rows: ChoiceRow[] = this.options.map((option, index) => ({
+         id: `o${index}`,
+         kind: "option",
+         label: option.title,
+         detail: option.description,
+         on: this.checked.has(index),
+      }));
+      if (this.allowComment) rows.push({ id: "comment", kind: "comment", label: COMMENT_TOGGLE_LABEL, on: this.commentEnabled });
+      if (this.allowFreeform) rows.push({ id: "freeform", kind: "freeform", label: "Other" });
+      return { rows, selected: this.selectedIndex };
+   }
+
+   /** Select row `row` of nativeSheet(); `activate` then acts as Space on it. */
+   selectRow(row: number, activate: boolean): void {
+      if (row < 0 || row >= this.getItemCount()) return;
+      this.selectedIndex = row;
+      this.invalidate();
+      if (activate) this.activate();
    }
 
    render(width: number): string[] {
@@ -1048,6 +1096,44 @@ class WrappedSingleSelectList implements Component {
       return visibleLines;
    }
 
+   /** Enter on the selected row: toggle the comment, open the custom response, or choose the option. */
+   private confirm(filteredOptions: QuestionOption[]): void {
+      if (this.isCommentToggleRow(this.selectedIndex, filteredOptions)) {
+         this.toggleComment();
+         return;
+      }
+      if (this.isFreeformRow(this.selectedIndex, filteredOptions)) {
+         this.onEnterFreeform?.();
+         return;
+      }
+
+      const result = filteredOptions[this.selectedIndex]?.title;
+      if (result) this.onSubmit?.(result);
+      else this.onCancel?.();
+   }
+
+   /** The rows as shown (filtered options, comment toggle, custom response), for Tern's native sheet. */
+   nativeSheet(): ChoiceList {
+      const rows: ChoiceRow[] = this.getFilteredOptions().map((option) => ({
+         id: `o${this.options.indexOf(option)}`,
+         kind: "option",
+         label: option.title,
+         detail: option.description,
+      }));
+      if (this.allowComment) rows.push({ id: "comment", kind: "comment", label: COMMENT_TOGGLE_LABEL, on: this.commentEnabled });
+      if (this.allowFreeform) rows.push({ id: "freeform", kind: "freeform", label: "Other" });
+      return { rows, selected: this.selectedIndex, query: this.searchQuery };
+   }
+
+   /** Select row `row` of nativeSheet(); `activate` then acts as Enter on it. */
+   selectRow(row: number, activate: boolean): void {
+      const filteredOptions = this.getFilteredOptions();
+      if (row < 0 || row >= this.getItemCount(filteredOptions)) return;
+      this.selectedIndex = row;
+      this.invalidate();
+      if (activate) this.confirm(filteredOptions);
+   }
+
    handleInput(data: string): void {
       if (this.searchQuery && matchesKey(data, Key.escape)) {
          this.setSearchQuery("");
@@ -1095,18 +1181,7 @@ class WrappedSingleSelectList implements Component {
       }
 
       if (this.keybindings.matches(data, "tui.select.confirm") && count > 0) {
-         if (this.isCommentToggleRow(this.selectedIndex, filteredOptions)) {
-            this.toggleComment();
-            return;
-         }
-         if (this.isFreeformRow(this.selectedIndex, filteredOptions)) {
-            this.onEnterFreeform?.();
-            return;
-         }
-
-         const result = filteredOptions[this.selectedIndex]?.title;
-         if (result) this.onSubmit?.(result);
-         else this.onCancel?.();
+         this.confirm(filteredOptions);
          return;
       }
 
@@ -1185,6 +1260,8 @@ class AskComponent extends Container {
    // A batch page shows its position in the frame title and a navigation hint.
    private frameTitle = "ask_user";
    private navigationHint: string | null = null;
+   // A batch page's question tabs in Tern's native sheet, and where choosing one goes.
+   private nativeTabs?: { tabs: QuestionTabs; go: (id: string) => void };
 
    // Static layout components
    private titleText: Text;
@@ -1778,6 +1855,77 @@ class AskComponent extends Container {
       this.updateHelpText();
    }
 
+   /** Batch pages: the question tabs of the native sheet. */
+   setNativeTabs(tabs: QuestionTabs, go: (id: string) => void): void {
+      this.nativeTabs = { tabs, go };
+   }
+
+   /**
+    * pi-tern's native presentation, in omp's ask style: the options as a list
+    * (a click is Enter on a row, Space on a multi-select option), or the custom
+    * response / comment over a native editor bound to pi's. Every pointer event
+    * runs the transition the keys run.
+    */
+   [NATIVE_COMPONENT](native: TernContext): TernNode {
+      const tabs = this.nativeTabs;
+      // A tab click; true when the event was one.
+      const onTab = (event: TernEvent): boolean => {
+         if (event.ev !== "select" || nodeKey(event.id) !== "tabs") return false;
+         tabs?.go(nodeKey(event.item));
+         return true;
+      };
+
+      if (this.mode === "freeform" || this.mode === "comment") {
+         const editor = this.ensureEditor();
+         native.field(editor);
+         const { line, col } = editor.getCursor();
+         const cursor = editor.getLines().slice(0, line).reduce((sum, text) => sum + text.length + 1, 0) + col;
+         const backToOptions = this.options.length > 0;
+         native.onEvent((event) => {
+            if (onTab(event) || event.ev !== "action") return;
+            if (event.act === "cancel" || event.act === "close") {
+               if (backToOptions) this.showSelectMode();
+               else this.onDone(null);
+            } else if (event.act === "submit") {
+               this.handleEditorSubmit(editor.getText());
+            }
+         });
+         return textSheet({
+            question: this.question,
+            context: this.context,
+            lead: this.mode === "comment" ? `Selected: ${this.pendingSelections.join(", ")}` : undefined,
+            text: editor.getText(),
+            cursor,
+            placeholder: this.mode === "comment" ? "Add context for your selection" : "Type your answer",
+            escape: backToOptions ? "back" : "cancel",
+            tabs: tabs?.tabs,
+         });
+      }
+
+      const list = this.allowMultiple ? this.ensureMultiSelectList() : this.ensureSingleSelectList();
+      const sheet = list.nativeSheet();
+      native.onEvent((event) => {
+         if (onTab(event)) return;
+         if (event.ev === "select" && nodeKey(event.id) === CHOICE_LIST_KEY) {
+            list.selectRow(sheet.rows.findIndex((row) => row.id === nodeKey(event.item)), true);
+         } else if (event.ev === "action") {
+            if (event.act === "cancel" || event.act === "close") this.onDone(null);
+            else if (event.act === "submit" && this.multiSelectList) this.multiSelectList.submit();
+            else if (event.act === "submit") list.selectRow(sheet.selected, true);
+         }
+         this.tui.requestRender();
+      });
+      return choiceSheet({
+         question: this.question,
+         context: this.context,
+         rows: sheet.rows,
+         selected: sheet.selected,
+         multiple: this.allowMultiple,
+         query: sheet.query,
+         tabs: tabs?.tabs,
+      });
+   }
+
    private ensureSingleSelectList(): WrappedSingleSelectList {
       if (this.singleSelectList) return this.singleSelectList;
 
@@ -2058,6 +2206,8 @@ class BatchAskComponent implements Component {
    private current = 0;
    private title = "";
    private confirmingSkips = false;
+   // The native sheets' question tabs, rebuilt with the frame title.
+   private tabs: QuestionTabs = { tabs: [], tab: "q0" };
    private reviewScrollOffset = 0;
    private reviewMaxScrollOffset = 0;
    private _focused = false;
@@ -2069,6 +2219,7 @@ class BatchAskComponent implements Component {
       private theme: Theme,
       private keybindings: KeybindingsManager,
       private onDone: (answers: BatchAnswer[] | null) => void,
+      private heading?: string,
    ) {
       this.answers = questions.map(() => undefined);
       this.pages = questions.map((entry, index) => new AskComponent(
@@ -2163,9 +2314,60 @@ class BatchAskComponent implements Component {
          return index === this.current ? `[${label}]` : label;
       });
       const review = this.current === this.questions.length ? "[review]" : "review";
-      this.title = `ask_user ${labels.join(" ")} · ${review}`;
+      // The frame title is one terminal row, so the heading's line breaks collapse here only.
+      const heading = this.heading ? ` · ${truncateToWidth(this.heading.replace(/\s+/g, " "), 40, "…")}` : "";
+      this.title = `ask_user${heading} ${labels.join(" ")} · ${review}`;
       const hint = literalHint(this.theme, "tab/shift+tab", "questions");
       for (const page of this.pages) page.setBatchChrome(this.title, hint);
+      this.tabs = {
+         tabs: [
+            ...this.questions.map((entry, index) => ({
+               id: `q${index}`,
+               label: `${this.answers[index] ? "✓ " : ""}${shortLabel(entry.question)}`,
+            })),
+            { id: "review", label: "Review" },
+         ],
+         tab: this.current < this.questions.length ? `q${this.current}` : "review",
+         ...(this.heading ? { heading: this.heading } : {}),
+      };
+      for (const page of this.pages) page.setNativeTabs(this.tabs, (id) => this.goToTab(id));
+   }
+
+   /** A native tab (`q<index>` or `review`). */
+   private goToTab(id: string): void {
+      const target = id === "review" ? this.questions.length : Number(id.slice(1));
+      if (Number.isInteger(target) && target >= 0 && target <= this.questions.length && target !== this.current) this.goTo(target);
+   }
+
+   /** pi-tern's native presentation: the current question's sheet, or the review sheet. */
+   [NATIVE_COMPONENT](native: TernContext): TernNode {
+      const page = this.pages[this.current];
+      if (page) return page[NATIVE_COMPONENT](native);
+      native.onEvent((event) => {
+         if (event.ev === "select" && nodeKey(event.id) === "tabs") this.goToTab(nodeKey(event.item));
+         else if (event.ev !== "action") return;
+         else if (event.act === "cancel" || event.act === "close") this.onDone(null);
+         else if (event.act === "submit") this.submitReview();
+      });
+      return reviewSheet({
+         rows: this.questions.map((entry, index) => {
+            const response = this.answers[index];
+            return { question: entry.question, answer: response ? formatResponseSummary(response) : undefined };
+         }),
+         tabs: this.tabs,
+         confirmSkips: this.confirmingSkips,
+      });
+   }
+
+   /** Submit from the review page; with unanswered questions, the first submit asks to confirm. */
+   private submitReview(): void {
+      if (this.unansweredCount() > 0 && !this.confirmingSkips) {
+         this.confirmingSkips = true;
+         this.tui.requestRender();
+         return;
+      }
+      this.onDone(this.answers.map((response): BatchAnswer =>
+         response ? { status: "answered", response } : { status: "skipped" }));
    }
 
    private unansweredCount(): number {
@@ -2178,13 +2380,7 @@ class BatchAskComponent implements Component {
          return;
       }
       if (this.keybindings.matches(data, "tui.select.confirm")) {
-         if (this.unansweredCount() > 0 && !this.confirmingSkips) {
-            this.confirmingSkips = true;
-            this.tui.requestRender();
-            return;
-         }
-         this.onDone(this.answers.map((response): BatchAnswer =>
-            response ? { status: "answered", response } : { status: "skipped" }));
+         this.submitReview();
          return;
       }
       // Kitty's keyboard protocol can deliver digits as CSI-u sequences.
@@ -2215,6 +2411,7 @@ class BatchAskComponent implements Component {
       const wrapFooter = (text: string) => wrapTextWithAnsi(text, innerWidth);
       const contentLines = [
          ...wrap(theme.fg("accent", theme.bold("Review answers"))),
+         ...(this.heading ? wrap(theme.fg("text", this.heading)) : []),
          "",
       ];
       this.questions.forEach((entry, index) => {
@@ -2388,12 +2585,13 @@ async function askBatchViaDialogs(
    allowComment: boolean,
    signal: AbortSignal | undefined,
    deadline: number | undefined,
+   heading?: string,
 ): Promise<BatchAnswer[] | null> {
    const dialogOpts = signal ? { signal } : undefined;
    const answers: BatchAnswer[] = [];
    for (const [index, entry] of questions.entries()) {
       if (signal?.aborted) return null;
-      const title = `(${index + 1}/${questions.length}) ${entry.question}`;
+      const title = `${heading ? `${heading}\n` : ""}(${index + 1}/${questions.length}) ${entry.question}`;
       let response: AskResponse | null;
       if (entry.options.length === 0) {
          // Same as a single question without options: a plain text answer.
@@ -2429,30 +2627,39 @@ interface PromptSettings {
    shortcuts: ResolvedAskShortcuts;
 }
 
-/** Resolve presentation preferences: call parameter, then env var, then built-in default. */
+/** Resolve presentation preferences: call parameter, then env var, then ask-user.json, then built-in default. */
 function resolvePromptSettings(params: AskParams): PromptSettings {
+   // Re-read on every ask_user call so edits to ask-user.json apply without restarting Pi.
+   const settings = loadAskUserSettings();
    const envMode = process.env.PI_ASK_USER_DISPLAY_MODE?.trim().toLowerCase();
    const envDisplayMode: AskDisplayMode | undefined =
       envMode === "overlay" || envMode === "inline" ? envMode : undefined;
    const envSingleSelectLayout = process.env.PI_ASK_USER_SINGLE_SELECT_LAYOUT?.trim().toLowerCase();
    return {
-      displayMode: params.displayMode ?? envDisplayMode ?? "overlay",
-      singleSelectLayout: params.singleSelectLayout ?? (envSingleSelectLayout === "list" ? "list" : "auto"),
+      displayMode: params.displayMode ?? envDisplayMode ?? settings.displayMode ?? "overlay",
+      singleSelectLayout: params.singleSelectLayout
+         ?? (envSingleSelectLayout === "list" || envSingleSelectLayout === "auto" ? envSingleSelectLayout : undefined)
+         ?? settings.singleSelectLayout
+         ?? "auto",
       allowComment: params.allowComment
          ?? parseBooleanPreference(process.env.PI_ASK_USER_ALLOW_COMMENT)
+         ?? settings.allowComment
          ?? false,
       contextExpanded: params.contextExpanded
          ?? parseBooleanPreference(process.env.PI_ASK_USER_CONTEXT_EXPANDED)
+         ?? settings.contextExpanded
          ?? false,
       shortcuts: {
          overlayToggle: resolveShortcut(
             params.overlayToggleKey,
             process.env.PI_ASK_USER_OVERLAY_TOGGLE_KEY,
+            settings.overlayToggleKey,
             DEFAULT_OVERLAY_TOGGLE_KEY,
          ),
          commentToggle: resolveShortcut(
             params.commentToggleKey,
             process.env.PI_ASK_USER_COMMENT_TOGGLE_KEY,
+            settings.commentToggleKey,
             DEFAULT_COMMENT_TOGGLE_KEY,
          ),
       },
@@ -2757,24 +2964,20 @@ async function runCustomPrompt<T>(ui: ExtensionUIContext, request: CustomPromptR
    }
 }
 
+/** A top-level question sent with questions is the batch's heading, not another question (#80). */
+function batchHeading(params: AskParams): string | undefined {
+   return typeof params.question === "string" && params.question.trim() ? params.question.trim() : undefined;
+}
+
 /**
  * Validate and normalize a `questions` batch. Every problem throws before any
  * UI opens or event fires (#67), with a message that tells the model how to
  * correct the call.
  */
 function normalizeBatchQuestions(params: AskParams): BatchQuestion[] {
+   // Top-level context/options/allowMultiple/allowFreeform are ignored here: entries carry their own,
+   // and models that echo schema defaults would otherwise loop on a validation error (#88).
    const { questions } = params;
-   if (typeof params.question === "string" && params.question.trim()) {
-      throw new Error(
-         "Use exactly one of question or questions. Put every question in questions, or ask a single question with question.",
-      );
-   }
-   const misplaced = BATCH_ENTRY_FIELDS.filter((field) => params[field] != null);
-   if (misplaced.length > 0) {
-      throw new Error(
-         `${misplaced.join(", ")} cannot be set at the top level together with questions. Set them on each questions entry instead.`,
-      );
-   }
    if (!Array.isArray(questions)) {
       throw new Error(`questions must be an array of ${BATCH_MIN_QUESTIONS}-${BATCH_MAX_QUESTIONS} question objects.`);
    }
@@ -2838,7 +3041,9 @@ function createAskEventEmitter(pi: ExtensionAPI) {
    // question and the response kind are broadcast; the context and the
    // user's actual selections/comment/freeform text stay inside the tool
    // result unless the user opts in (#51).
-   const emitFullEvents = parseBooleanPreference(process.env.PI_ASK_USER_EMIT_FULL_EVENTS) ?? false;
+   const emitFullEvents = parseBooleanPreference(process.env.PI_ASK_USER_EMIT_FULL_EVENTS)
+      ?? loadAskUserSettings().emitFullEvents
+      ?? false;
    return {
       answered(subject: AskEventSubject, response: AskResponse, batch?: BatchPosition): void {
          const position = batch ? { batch } : {};
@@ -2862,16 +3067,17 @@ function createAskEventEmitter(pi: ExtensionAPI) {
 }
 
 function formatBatchAnswers(details: AskBatchDetails): string {
+   const heading = details.heading ? [details.heading] : [];
    const lines = details.questions.map((subject, index) => {
       const answer = details.answers[index]!;
       const summary = answer.status === "answered" ? formatResponseSummary(answer.response) : "(skipped)";
       return `${index + 1}. ${subject.question} → ${summary}`;
    });
    const answered = details.answers.filter((answer) => answer.status === "answered").length;
-   return [`User answered ${answered} of ${details.questions.length} questions:`, ...lines].join("\n");
+   return [...heading, `User answered ${answered} of ${details.questions.length} questions:`, ...lines].join("\n");
 }
 
-function formatBatchForMessage(questions: BatchQuestion[], allowComment: boolean): string {
+function formatBatchForMessage(questions: BatchQuestion[], allowComment: boolean, heading?: string): string {
    const blocks = questions.map((entry, index) => {
       const lines = [`${index + 1}. ${entry.question}`];
       if (entry.context) lines.push(`   Context: ${entry.context.replace(/\n/g, "\n   ")}`);
@@ -2883,7 +3089,8 @@ function formatBatchForMessage(questions: BatchQuestion[], allowComment: boolean
       return lines.join("\n");
    });
    const commentHint = allowComment ? "\n\nAfter choosing an option, you may add an optional comment." : "";
-   return `Ask requires interactive mode. Please answer these questions:\n\n${blocks.join("\n\n")}${commentHint}`;
+   const intro = heading ? `\n\n${heading}` : "";
+   return `Ask requires interactive mode. Please answer these questions:${intro}\n\n${blocks.join("\n\n")}${commentHint}`;
 }
 
 function batchQuestionId(index: number): string {
@@ -2898,18 +3105,20 @@ async function executeBatch(
    ctx: ExtensionContext,
 ): Promise<AgentToolResult<AskBatchDetails>> {
    const questions = normalizeBatchQuestions(params);
+   const heading = batchHeading(params);
    const settings = resolvePromptSettings(params);
    const events = createAskEventEmitter(pi);
    const subjects = questions.map(({ question, context, options }) => ({ question, context, options }));
    const details = (answers: BatchAnswer[], cancelled: boolean): AskBatchDetails => ({
       kind: "batch",
+      ...(heading ? { heading } : {}),
       questions: subjects,
       answers,
       cancelled,
    });
 
    if (!ctx.hasUI || !ctx.ui) {
-      throw new Error(formatBatchForMessage(questions, settings.allowComment));
+      throw new Error(formatBatchForMessage(questions, settings.allowComment, heading));
    }
 
    onUpdate?.({
@@ -2935,8 +3144,8 @@ async function executeBatch(
          displayMode: settings.displayMode,
          overlayToggle: settings.shortcuts.overlayToggle,
          createComponent: (tui, theme, keybindings, complete) =>
-            new BatchAskComponent(questions, settings, tui, theme, keybindings, complete),
-         fallback: () => askBatchViaDialogs(ctx.ui, questions, settings.allowComment, batch.signal, deadline),
+            new BatchAskComponent(questions, settings, tui, theme, keybindings, complete, heading),
+         fallback: () => askBatchViaDialogs(ctx.ui, questions, settings.allowComment, batch.signal, deadline, heading),
          web: {
             questions: questions.map((entry, index) =>
                webQuestion(batchQuestionId(index), entry.question, entry.context, entry.options, entry.allowMultiple, entry.allowFreeform)),
@@ -3053,6 +3262,7 @@ export default function(pi: ExtensionAPI) {
          "Use ask_user when the user's intent is ambiguous, when a decision requires explicit user input, or when multiple valid options exist.",
          "Ask one focused question per ask_user call by default.",
          "Use questions (2-4 entries) only for independent decisions whose prerequisites are already settled; ask anything that depends on another answer in a later ask_user call.",
+         "With questions, put every question inside questions. A top-level question is only shown as the batch heading and is never asked or answered.",
          "Do not combine multiple numbered, multipart, or unrelated questions into one question's text.",
       ],
       // Block other tool calls in the same assistant turn until the user answers,
@@ -3061,7 +3271,7 @@ export default function(pi: ExtensionAPI) {
       executionMode: "sequential",
       parameters: Type.Object({
          question: Type.Optional(
-            Type.String({ description: "The question to ask the user. Omit when using questions." }),
+            Type.String({ description: "The question to ask the user. With questions, it is only an optional heading for the batch; put every actual question inside questions." }),
          ),
          questions: Type.Optional(
             Type.Array(
@@ -3102,33 +3312,33 @@ export default function(pi: ExtensionAPI) {
             Type.Boolean({ description: "Add a freeform text option. Default: true" }),
          ),
          allowComment: Type.Optional(
-            Type.Boolean({ description: "Collect an optional comment after selecting one or more options. Default: PI_ASK_USER_ALLOW_COMMENT env var if set, otherwise false." }),
+            Type.Boolean({ description: "Collect an optional comment after selecting one or more options. Default: PI_ASK_USER_ALLOW_COMMENT env var or allowComment in ~/.pi/agent/ask-user.json (respecting PI_CODING_AGENT_DIR) if set, otherwise false." }),
          ),
          displayMode: Type.Optional(
             StringEnum(["overlay", "inline"] as const, {
-               description: "UI rendering mode. 'overlay' shows a centered modal, 'inline' renders in-place. Default: PI_ASK_USER_DISPLAY_MODE env var if set, otherwise 'overlay'. Omit to respect the user's configured preference.",
+               description: "UI rendering mode. 'overlay' shows a centered modal, 'inline' renders in-place. Default: PI_ASK_USER_DISPLAY_MODE env var, then displayMode in ~/.pi/agent/ask-user.json (respecting PI_CODING_AGENT_DIR), otherwise 'overlay'. Omit to respect the user's configured preference.",
             }),
          ),
          singleSelectLayout: Type.Optional(
             StringEnum(["auto", "list"] as const, {
-               description: "Single-select layout. 'auto' uses a details pane on wide terminals; 'list' always keeps descriptions below options. Default: PI_ASK_USER_SINGLE_SELECT_LAYOUT if set, otherwise 'auto'.",
+               description: "Single-select layout. 'auto' uses a details pane on wide terminals; 'list' always keeps descriptions below options. Default: PI_ASK_USER_SINGLE_SELECT_LAYOUT env var, then singleSelectLayout in ~/.pi/agent/ask-user.json (respecting PI_CODING_AGENT_DIR), otherwise 'auto'.",
             }),
          ),
          contextExpanded: Type.Optional(
             Type.Boolean({
-               description: "Start with oversized context expanded instead of collapsed behind a one-line summary. Default: PI_ASK_USER_CONTEXT_EXPANDED env var if set, otherwise false.",
+               description: "Start with oversized context expanded instead of collapsed behind a one-line summary. Default: PI_ASK_USER_CONTEXT_EXPANDED env var or contextExpanded in ~/.pi/agent/ask-user.json (respecting PI_CODING_AGENT_DIR) if set, otherwise false.",
             }),
          ),
          overlayToggleKey: Type.Optional(
             Type.String({
                description:
-                  "Shortcut for hiding/showing the overlay popup (overlay mode only), e.g. 'alt+o' or 'ctrl+shift+h'. Pass 'off' to disable. Default: PI_ASK_USER_OVERLAY_TOGGLE_KEY env var if set, otherwise 'alt+o'.",
+                  "Shortcut for hiding/showing the overlay popup (overlay mode only), e.g. 'alt+o' or 'ctrl+shift+h'. Pass 'off' to disable. Default: PI_ASK_USER_OVERLAY_TOGGLE_KEY env var, then overlayToggleKey in ~/.pi/agent/ask-user.json (respecting PI_CODING_AGENT_DIR), otherwise 'alt+o'.",
             }),
          ),
          commentToggleKey: Type.Optional(
             Type.String({
                description:
-                  "Shortcut for toggling the optional comment/extra-context row when allowComment is true, e.g. 'ctrl+g'. Pass 'off' to disable. Default: PI_ASK_USER_COMMENT_TOGGLE_KEY env var if set, otherwise 'ctrl+g'.",
+                  "Shortcut for toggling the optional comment/extra-context row when allowComment is true, e.g. 'ctrl+g'. Pass 'off' to disable. Default: PI_ASK_USER_COMMENT_TOGGLE_KEY env var, then commentToggleKey in ~/.pi/agent/ask-user.json (respecting PI_CODING_AGENT_DIR), otherwise 'ctrl+g'.",
             }),
          ),
          timeout: Type.Optional(
@@ -3284,6 +3494,9 @@ export default function(pi: ExtensionAPI) {
             const entries: unknown[] = args.questions;
             let text = theme.fg("toolTitle", theme.bold("ask_user "));
             text += theme.fg("muted", `${entries.length} questions`);
+            if (typeof args.question === "string" && args.question.trim()) {
+               text += theme.fg("text", ` · ${args.question.trim().replace(/\s+/g, " ")}`);
+            }
             if (args.allowComment) {
                text += theme.fg("dim", " [optional comment]");
             }
@@ -3367,4 +3580,6 @@ export default function(pi: ExtensionAPI) {
          return new Text(text, 0, 0);
       },
    });
+   // In Tern (with pi-tern), the card is drawn natively; pi's renderers above serve every other terminal.
+   registerTernTool(pi, "ask_user", askToolCard);
 }

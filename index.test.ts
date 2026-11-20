@@ -1,10 +1,23 @@
-import { beforeAll, describe, expect, mock, onTestFinished, spyOn, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, mock, onTestFinished, spyOn, test } from "bun:test";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { getEventListeners } from "node:events";
+import * as realPiTui from "@earendil-works/pi-tui";
 import type { StringEnumBuilder } from "./index";
+import { NATIVE_COMPONENT, type TernContext, type TernEvent, type TernNode } from "./tern";
+
+// Snapshot the real pi-tui before beforeAll mocks it, so afterAll can restore
+// it for test files that run later in the same Bun process.
+const realPiTuiExports = { ...realPiTui };
 
 let editorInputs: string[] = [];
 let editorText = "";
 let emittedEvents: Array<{ name: string; payload: any }> = [];
+
+let isolatedAgentDir: string;
+let originalAgentDir: string | undefined;
+let originalPreferences: Record<string, string> = {};
 
 function wrapPlainText(text: string, width = 80): string[] {
    const lines: string[] = [];
@@ -203,6 +216,34 @@ beforeAll(() => {
          Unsafe: (value: unknown) => value,
       },
    }));
+
+   // Isolate preference resolution from the developer's real agent directory,
+   // even when PI_CODING_AGENT_DIR points at a configured one: a local
+   // ask-user.json must not leak into overlay/layout defaults. Tests that
+   // exercise the settings file point this at their own temp directory via
+   // stubEnv, which restores this baseline afterwards.
+   isolatedAgentDir = mkdtempSync(join(tmpdir(), "ask-user-test-agent-dir-"));
+   originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+   process.env.PI_CODING_AGENT_DIR = isolatedAgentDir;
+
+   // The developer's own PI_ASK_USER_* preferences must not change the defaults
+   // under test either. Tests that exercise one set it through stubEnv.
+   for (const key of Object.keys(process.env)) {
+      if (!key.startsWith("PI_ASK_USER_")) continue;
+      originalPreferences[key] = process.env[key]!;
+      delete process.env[key];
+   }
+});
+
+afterAll(() => {
+   mock.module("@earendil-works/pi-tui", () => realPiTuiExports);
+   if (originalAgentDir === undefined) {
+      delete process.env.PI_CODING_AGENT_DIR;
+   } else {
+      process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+   }
+   Object.assign(process.env, originalPreferences);
+   originalPreferences = {};
 });
 
 type RegisteredTool = {
@@ -230,6 +271,8 @@ async function setupTool(): Promise<RegisteredTool> {
       registerTool(tool: RegisteredTool) {
          registeredTool = tool;
       },
+      // Lifecycle hooks (the Tern card registration); these tests never start a session.
+      on() {},
       events: {
          emit(name: string, payload: any) {
             emittedEvents.push({ name, payload });
@@ -3465,7 +3508,6 @@ describe("questions batch", () => {
    const twoQuestions = [{ question: "First?" }, { question: "Second?" }];
    const validationCases: Array<{ name: string; params: Record<string, unknown>; expected: string[]; noUI?: boolean }> = [
       { name: "neither question nor questions", params: {}, expected: ["needs question"] },
-      { name: "both question and questions", params: { question: "Q?", questions: twoQuestions }, expected: ["exactly one of question or questions"] },
       { name: "a single entry", params: { questions: [{ question: "Only?" }] }, expected: ["got 1", "use question instead"] },
       { name: "five entries", params: { questions: ["A?", "B?", "C?", "D?", "E?"].map((question) => ({ question })) }, expected: ["at most 4"] },
       { name: "a non-array questions value", params: { questions: "First?" }, expected: ["must be an array"] },
@@ -3475,11 +3517,6 @@ describe("questions batch", () => {
          name: "an entry whose options are all malformed",
          params: { questions: [{ question: "First?" }, { question: "Second?", options: [{}, "  "] }] },
          expected: ["in questions[1] were malformed", "{ \"title\": \"Short label\""],
-      },
-      {
-         name: "single-question fields at the top level",
-         params: { context: "shared", options: ["A"], questions: twoQuestions },
-         expected: ["context, options cannot be set at the top level"],
       },
       {
          name: "no interactive UI",
@@ -3502,6 +3539,43 @@ describe("questions batch", () => {
          expect(emittedEvents).toEqual([]);
       });
    }
+
+   test("a top-level question sent with questions becomes the batch heading, not a question (#80)", async () => {
+      const tool = await setupTool();
+      const { state, custom } = mountBatchPrompt();
+      const execution = tool.execute(
+         "id",
+         { question: "Project setup\nChoose defaults", questions: [{ question: "Which database?", options: ["Postgres", "SQLite"] }, { question: "Which ORM?", options: ["Drizzle", "Prisma"] }] },
+         undefined,
+         undefined,
+         { hasUI: true, ui: { custom } },
+      );
+      const prompt = state.component;
+      expect(prompt.render(100).join("\n")).toContain("ask_user · Project setup Choose defaults [1] 2 · review");
+      expect(prompt.render(100).some((row: string) => row.includes("\n"))).toBe(false);
+      press(prompt, "enter", "enter");
+      expect(prompt.render(100).join("\n")).toContain("Project setup");
+      press(prompt, "enter");
+      const result = await execution;
+      expect(result.details.heading).toBe("Project setup\nChoose defaults");
+      expect(result.details.questions.map((entry: { question: string }) => entry.question)).toEqual(["Which database?", "Which ORM?"]);
+      expect(result.content[0].text).toBe("Project setup\nChoose defaults\nUser answered 2 of 2 questions:\n1. Which database? → Postgres\n2. Which ORM? → Drizzle");
+   });
+
+test("top-level single-question fields sent with questions are ignored (#88)", async () => {
+      const tool = await setupTool();
+      const { state, custom } = mountBatchPrompt();
+      const execution = tool.execute(
+         "id",
+         { context: "", options: [], allowMultiple: false, allowFreeform: false, questions: [{ question: "Which database?", options: ["Postgres", "SQLite"] }, { question: "Which ORM?", options: ["Drizzle", "Prisma"] }] },
+         undefined,
+         undefined,
+         { hasUI: true, ui: { custom } },
+      );
+      press(state.component, "enter", "enter", "enter");
+      const result = await execution;
+      expect(result.content[0].text).toBe("User answered 2 of 2 questions:\n1. Which database? → Postgres\n2. Which ORM? → Drizzle");
+   });
 
    test("records each page's answer and publishes nothing until the review page submits", async () => {
       stubEnv("PI_ASK_USER_EMIT_FULL_EVENTS", "false");
@@ -3882,5 +3956,301 @@ describe("questions batch", () => {
 
       expect(render({ ...details, answers: [], cancelled: true }, false)).toBe("Cancelled");
       expect(render(details, false, { isError: true })).toBe("✗ boom");
+   });
+
+   describe("ask-user.json settings file", () => {
+      function stubSettingsFile(contents: string): void {
+         const dir = mkdtempSync(join(tmpdir(), "ask-user-agent-dir-"));
+         writeFileSync(join(dir, "ask-user.json"), contents, "utf8");
+         stubEnv("PI_CODING_AGENT_DIR", dir);
+      }
+
+      async function executeWithCapturedOptions(params: Record<string, unknown>): Promise<any> {
+         const tool = await setupTool();
+         let capturedOptions: any;
+         await tool.execute(
+            "tool-call-id",
+            { question: "Which option should we use?", options: ["A", "B"], ...params },
+            undefined,
+            undefined,
+            {
+               hasUI: true,
+               ui: {
+                  custom: async (_factory: any, options: any) => {
+                     capturedOptions = options;
+                     return null;
+                  },
+               },
+            },
+         );
+         return capturedOptions;
+      }
+
+      test("uses ask-user.json displayMode when the env var and call-level value are unset", async () => {
+         stubSettingsFile(JSON.stringify({ displayMode: "inline" }));
+         const capturedOptions = await executeWithCapturedOptions({});
+         expect(capturedOptions).toBeUndefined();
+      });
+
+      test("PI_ASK_USER_DISPLAY_MODE env var overrides ask-user.json", async () => {
+         stubSettingsFile(JSON.stringify({ displayMode: "overlay" }));
+         stubEnv("PI_ASK_USER_DISPLAY_MODE", "inline");
+         const capturedOptions = await executeWithCapturedOptions({});
+         expect(capturedOptions).toBeUndefined();
+      });
+
+      test("call-level displayMode overrides ask-user.json", async () => {
+         stubSettingsFile(JSON.stringify({ displayMode: "inline" }));
+         const capturedOptions = await executeWithCapturedOptions({ displayMode: "overlay" });
+         expect(capturedOptions.overlay).toBe(true);
+      });
+
+      test("ignores unrecognised ask-user.json displayMode and falls back to overlay", async () => {
+         stubSettingsFile(JSON.stringify({ displayMode: "fullscreen" }));
+         const capturedOptions = await executeWithCapturedOptions({});
+         expect(capturedOptions.overlay).toBe(true);
+      });
+
+      test("malformed ask-user.json fails the call with the file path", async () => {
+         stubSettingsFile("{ not json");
+         const tool = await setupTool();
+         await expect(
+            tool.execute(
+               "tool-call-id",
+               { question: "Which option should we use?", options: ["A", "B"] },
+               undefined,
+               undefined,
+               { hasUI: true, ui: { custom: async () => null } },
+            ),
+         ).rejects.toThrow(/ask-user\.json/);
+      });
+
+      async function renderSingleSelectWithSettings(params: Record<string, unknown> = {}): Promise<string> {
+         const tool = await setupTool();
+         let rendered = "";
+         await tool.execute(
+            "tool-call-id",
+            {
+               question: "Which option should we use?",
+               options: [{ title: "Alpha", description: "Alpha details." }],
+               ...params,
+            },
+            undefined,
+            undefined,
+            {
+               hasUI: true,
+               ui: {
+                  custom: async (factory: unknown) => {
+                     rendered = renderSingleSelectFromFactory(factory);
+                     return null;
+                  },
+               },
+            },
+         );
+         return rendered;
+      }
+
+      test("applies singleSelectLayout from ask-user.json when the env var is unset", async () => {
+         stubSettingsFile(JSON.stringify({ singleSelectLayout: "list" }));
+         const rendered = await renderSingleSelectWithSettings();
+         expect(rendered).not.toContain("## Alpha");
+      });
+
+      test("PI_ASK_USER_SINGLE_SELECT_LAYOUT=auto overrides ask-user.json singleSelectLayout", async () => {
+         stubSettingsFile(JSON.stringify({ singleSelectLayout: "list" }));
+         stubEnv("PI_ASK_USER_SINGLE_SELECT_LAYOUT", "auto");
+         const rendered = await renderSingleSelectWithSettings();
+         expect(rendered).toContain("## Alpha");
+      });
+
+      test("valid overlayToggleKey in ask-user.json replaces the default alt+o", async () => {
+         stubSettingsFile(JSON.stringify({ overlayToggleKey: "alt+h" }));
+         const tool = await setupTool();
+         const calls: boolean[] = [];
+         let inputHandler: ((data: string) => any) | undefined;
+
+         await tool.execute(
+            "tool-call-id",
+            { question: "Q", options: ["A"] },
+            undefined,
+            undefined,
+            {
+               hasUI: true,
+               ui: {
+                  custom: async (_factory: any, options: any) => {
+                     options.onHandle?.({
+                        hide() { },
+                        setHidden(value: boolean) { calls.push(value); },
+                        isHidden() { return false; },
+                        focus() { },
+                     });
+                     const ignored = inputHandler?.("alt+o");
+                     const consumed = inputHandler?.("alt+h");
+                     expect(ignored).toBeUndefined();
+                     expect(consumed).toEqual({ consume: true });
+                     return null;
+                  },
+                  onTerminalInput: (handler: (data: string) => any) => {
+                     inputHandler = handler;
+                     return () => { };
+                  },
+                  notify: () => { },
+               },
+            },
+         );
+
+         expect(calls).toEqual([true]);
+      });
+
+      test("invalid overlayToggleKey in ask-user.json falls back to the default alt+o", async () => {
+         stubSettingsFile(JSON.stringify({ overlayToggleKey: "alt+ space" }));
+         const tool = await setupTool();
+         const calls: boolean[] = [];
+         let inputHandler: ((data: string) => any) | undefined;
+
+         await tool.execute(
+            "tool-call-id",
+            { question: "Q", options: ["A"] },
+            undefined,
+            undefined,
+            {
+               hasUI: true,
+               ui: {
+                  custom: async (_factory: any, options: any) => {
+                     options.onHandle?.({
+                        hide() { },
+                        setHidden(value: boolean) { calls.push(value); },
+                        isHidden() { return false; },
+                        focus() { },
+                     });
+                     const consumed = inputHandler?.("alt+o");
+                     expect(consumed).toEqual({ consume: true });
+                     return null;
+                  },
+                  onTerminalInput: (handler: (data: string) => any) => {
+                     inputHandler = handler;
+                     return () => { };
+                  },
+                  notify: () => { },
+               },
+            },
+         );
+
+         expect(calls).toEqual([true]);
+      });
+
+      test("invalid commentToggleKey in ask-user.json falls back to the default ctrl+g", async () => {
+         stubSettingsFile(JSON.stringify({ commentToggleKey: "alt+ space" }));
+         const tool = await setupTool();
+         let renderedAfter = "";
+
+         await tool.execute(
+            "tool-call-id",
+            { question: "Q", options: ["Alpha", "Beta"], allowComment: true },
+            undefined,
+            undefined,
+            {
+               hasUI: true,
+               ui: {
+                  custom: async (factory: any) => {
+                     const component = factory(
+                        { requestRender() { }, terminal: { rows: 24 } },
+                        createTheme(),
+                        createKeybindings(),
+                        () => { },
+                     );
+                     component.handleInput("ctrl+g");
+                     renderedAfter = ((component as any).singleSelectList as any).render(80).join("\n");
+                     return null;
+                  },
+               },
+            },
+         );
+
+         expect(renderedAfter).toContain("[✓] Add extra context after selection");
+      });
+   });
+});
+
+describe("Tern native presentation", () => {
+   // pi-tern names list children and the emitting node by full id, as Tern does.
+   const list = "dock.dialog.options";
+
+   interface NativePrompt {
+      [NATIVE_COMPONENT](native: TernContext): TernNode;
+   }
+   type TuiStub = { requestRender(): void; terminal: { rows: number } };
+   type ThemeStub = { fg(color: string, text: string): string; bold(text: string): string };
+   type KeybindingsStub = { matches(data: string, keybinding: string): boolean; getKeys(keybinding: string): string[] };
+   type NativePromptFactory<Answer> = (tui: TuiStub, theme: ThemeStub, keybindings: KeybindingsStub, done: (answer: Answer) => void) => NativePrompt;
+
+   /** The prompt's native sheet and a way to send it Tern events, as pi-tern does on each render. */
+   function present(component: NativePrompt) {
+      let handler: ((event: TernEvent) => void) | undefined;
+      const node = component[NATIVE_COMPONENT]({ requestRender() { }, onEvent(listener) { handler = listener; }, field() { } });
+      return { node, fire: (event: TernEvent) => handler?.(event) };
+   }
+
+   /** Run ask_user with a UI that hands the created prompt to `drive`. */
+   type AskArgs = { question?: string; options?: string[]; questions?: { question: string; options: string[]; allowMultiple?: boolean }[] };
+   async function run(params: AskArgs, drive: (component: NativePrompt) => void) {
+      const tool = await setupTool();
+      return tool.execute("tool-call-id", { ...params, displayMode: "inline" }, undefined, undefined, {
+         hasUI: true,
+         ui: {
+            custom<Answer>(factory: NativePromptFactory<Answer>): Promise<Answer> {
+               const { promise, resolve } = Promise.withResolvers<Answer>();
+               drive(factory({ requestRender() { }, terminal: { rows: 24 } }, createTheme(), createKeybindings(), resolve));
+               return promise;
+            },
+         },
+      });
+   }
+
+   test("a click on an option answers a single question", async () => {
+      const result = await run({ question: "Which one?", options: ["A", "B"] }, (component) => {
+         const { node, fire } = present(component);
+         expect(node).toMatchObject({ k: "col", p: { role: "omp.editor.ask" } });
+         fire({ ev: "select", id: list, item: `${list}.o1` });
+      });
+      expect(result.details.response).toEqual({ kind: "selection", selections: ["B"] });
+   });
+
+   test("a batch is answered by clicks: a choice, a multi-select toggle with Submit, then the review's Submit", async () => {
+      const result = await run({
+         questions: [
+            { question: "Region?", options: ["us", "eu"] },
+            { question: "Features?", options: ["Backups", "Metrics"], allowMultiple: true },
+         ],
+      }, (component) => {
+         present(component).fire({ ev: "select", id: list, item: `${list}.o1` });
+         // A multi-select click ticks the option; it is not an answer until Submit.
+         present(component).fire({ ev: "select", id: list, item: `${list}.o1` });
+         const options = present(component).node.c.find((child) => child.key === "options");
+         expect(options?.c[1]?.p.icon).toBe("check");
+         present(component).fire({ ev: "action", act: "submit" });
+         const review = present(component);
+         expect(JSON.stringify(review.node)).toContain("Review");
+         review.fire({ ev: "action", act: "submit" });
+      });
+      expect(result.details.answers).toEqual([
+         { status: "answered", response: { kind: "selection", selections: ["eu"] } },
+         { status: "answered", response: { kind: "selection", selections: ["Metrics"] } },
+      ]);
+   });
+
+      test("a batch heading shows on every native question sheet and the review", async () => {
+      await run({
+         question: "Project setup",
+         questions: [{ question: "Region?", options: ["us", "eu"] }, { question: "Tier?", options: ["free", "pro"] }],
+      }, (component) => {
+         const headingOf = () => JSON.stringify(present(component).node.c.find((child) => child.key === "heading")?.p.spans);
+         expect(headingOf()).toBe(JSON.stringify([{ t: "Project setup" }]));
+         present(component).fire({ ev: "select", id: list, item: `${list}.o0` });
+         present(component).fire({ ev: "select", id: list, item: `${list}.o0` });
+         expect(JSON.stringify(present(component).node)).toContain("Review");
+         expect(headingOf()).toBe(JSON.stringify([{ t: "Project setup" }]));
+         present(component).fire({ ev: "action", act: "submit" });
+      });
    });
 });

@@ -1,6 +1,7 @@
 {
   "name": "@gang-of-beads/pi-ask-user",
-  "version": "0.16.1",
+  
+  "version": "0.17.2",
   "description": "Interactive ask_user tool for pi-coding-agent with searchable split-pane selection UI, multi-select, and freeform input",
   "type": "module",
   "keywords": [
@@ -35,7 +36,9 @@
   },
   "files": [
     "index.ts",
+    "settings.ts",
     "single-select-layout.ts",
+    "tern.ts",
     "skills",
     "README.md",
     "LICENSE"
@@ -50,8 +53,8 @@
     "check": "bun run test && bun run typecheck && bun run check:host && bun run check:docs && bun run check:package"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "1.3.0",
-    "@earendil-works/pi-tui": "1.3.0",
+    "@earendil-works/pi-coding-agent": "1.5.2",
+    "@earendil-works/pi-tui": "1.5.2",
     "@sinclair/typebox": "0.34.52",
     "@types/bun": "1.3.14",
     "@types/node": "22.19.0",
