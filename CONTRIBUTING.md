@@ -26,7 +26,7 @@ when intentionally updating development dependencies.
   runtime and documentation files.
 
 `bun run check` runs all of these. CI checks Node.js 22 and 24 with Pi 0.74.0
-(the supported minimum) and the pinned current host, 0.87.0. Runtime peer ranges
+(the supported minimum) and the pinned current host, 1.5.2. Runtime peer ranges
 remain unchanged. Updating the current development host also requires updating
 the CI matrix and checking the minimum host.
 
@@ -35,6 +35,9 @@ wide terminals, resize, long context, comments/freeform, timeout and abort, and
 non-ASCII text. Automated smoke checks do not replace interactive verification.
 
 ## Pull requests
+
+This project does not accept outside pull requests. Please open an issue for
+bugs or feature requests instead; changes are made by the maintainer.
 
 Keep changes small and explain their behavior and tests. Include a regression
 test for a bug fix. For cancellation, verify that the dialog closes, owned
@@ -48,9 +51,18 @@ Remove private question/answer content before sharing logs.
 
 ## Releases
 
-Publishing runs the same checks before calling npm. A tag-triggered release must
-match `package.json`. Keep the changelog current and verify the published package
-version, contents, installation, and provenance after a successful run. An
+Releases are cut by release-please from Conventional Commit messages: `fix:`
+bumps the patch version, `feat:` the minor version (also for breaking changes
+while below 1.0), and other types do not release. It keeps a release PR open
+with the version bump and the generated `CHANGELOG.md` entry; merging that PR
+tags `vX.Y.Z`, creates the GitHub release, and dispatches `publish.yml` on the
+tag.
+
+Publishing runs the same checks before calling npm. `publish.yml` authenticates
+through npm trusted publishing (OIDC); there is no npm token secret, and the
+trusted publisher on npmjs.com must keep naming `edlsh/pi-ask-user` and
+`publish.yml`. The release tag must match `package.json`. Verify the published
+package version, contents, installation, and provenance after a successful run. An
 already-published version being skipped is not proof that publishing works.
 
 Do not overwrite published versions or move historical release tags. Changes to
